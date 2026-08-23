@@ -1,448 +1,214 @@
-# Drug Discovery MCP Server
+# Drug Discovery MCP Server 🧬⚡
 
-An MCP (Model Context Protocol) server for assisting Mistral Vibe with early-stage drug discovery tasks, inspired by the DrugDiscoveryBench benchmark and BIOMNI framework.
+**An MCP server that gives [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 30+ live drug discovery tools — then measures what they're worth on [DrugDiscoveryBench](https://github.com/scaleapi/DrugDiscoveryBench), 82 expert-authored tasks graded against rubrics by an LLM judge.**
 
-## Overview
+> Built on the [official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk). Every database tool hits a live API — no fixtures, no cached snapshots. Register it with one command and Vibe can pull p53's sequence, score a compound against Lipinski, or superimpose two crystal structures and get an RMSD.
 
-This server provides 200+ biomedical and drug discovery tools across 22 domains, enabling AI agents to:
-- Query biological databases (UniProt, ChEMBL, OpenTargets, PDB, etc.)
-- Perform cheminformatics calculations (RDKit)
-- Analyze protein structures and molecular interactions
-- Mine patents and scientific literature
-- Execute multi-step drug discovery workflows
+| | Result |
+|---|---|
+| **Benchmark score** | **23.8** mean outcome on DrugDiscoveryBench (63 tasks) |
+| **Tasks solved outright** | **10** · 21 scoring above zero |
+| **Tools exposed** | **30** over MCP — 10 database, 10 cheminformatics, 10 structural biology |
+| **Full suite runtime** | **~2.5 h** on a laptop, no container, 6-way concurrency |
 
-## Architecture
+<p align="center">
+  <img src="assets/leaderboard.png" width="95%" alt="Mistral Vibe with the Drug Discovery MCP server on the DrugDiscoveryBench leaderboard"/>
+</p>
+
+*Agent: Mistral Vibe (`mistral-vibe-cli-latest`) · Judge: `mistral-large-latest` · scored by each task's own `judge.py` against the gated expert rubrics. Published leaderboard figures carry ± standard error over repeated trials; ours is a single run.*
+
+<!-- BENCH:START -->
+
+Agent **Mistral Vibe** (`mistral-vibe-cli-latest`) with this project's MCP
+server registered; judge **`mistral-large-latest`**. Run in progress (63/82), last updated 2026-08-23 00:13 UTC.
+
+| metric | value |
+|---|---|
+| tasks graded | 63 / 82 |
+| **mean score** (outcome) | **0.238** |
+| solved (1.0) | 10 |
+| partial (0 < s < 1) | 11 |
+| zero | 42 |
+| no answer produced | 6 |
+| judge failures | 0 |
+
+Top 10 tasks:
+
+| score | task |
+|---|---|
+| 1.000 | `69b34fde93a696047cbf9c73` |
+| 1.000 | `69b43e08f5a8ac5b38e3c5f0` |
+| 1.000 | `69b43e08f5a8ac5b38e3c5f3` |
+| 1.000 | `69b43e08f5a8ac5b38e3c60e` |
+| 1.000 | `69b43e08f5a8ac5b38e3c617` |
+| 1.000 | `69b43e08f5a8ac5b38e3c62b` |
+| 1.000 | `69b43e08f5a8ac5b38e3c637` |
+| 1.000 | `69e6b5dade74c4d1f5fa934c` |
+| 1.000 | `69e6b5dade74c4d1f5fa9350` |
+| 1.000 | `69e6b5dade74c4d1f5fa9351` |
+
+Scored by each task's own `judge.py` against the gated expert rubrics.
+
+<!-- BENCH:END -->
+
+---
+
+## The story: how the harness got better every iteration
+
+The first end-to-end run scored **0.429** on its task. Nothing about the model changed after that — every gain below came from fixing the harness around it.
+
+| # | Change | What was wrong | Effect |
+|--:|---|---|---|
+| 1 | **Baseline** | Vibe answers, the task's own judge grades | 0.429 on the colon/Moertel task |
+| 2 | **Ground answers in retrieved data** | Agent answered from memory; recalled figures were wrong in detail | **0.429 → 0.714** on the same task |
+| 3 | **Skip process grading** | Judge chunked a 456 KB trajectory on every task | **39 s → 9 s**, score provably unchanged |
+| 4 | **6-way concurrency** | One task at a time | **4.3×** — 6 tasks in 16 min vs ~69 min serial |
+| 5 | **Fix the answer path** | Agent nested `answer.md`; fallback grabbed chat prose | clean terse answers, no prose penalty |
+| 6 | **Survive turn-limit exits** | Vibe discards the whole transcript on turn limit | no-answer rate **1-in-9 → 1-in-37** |
+
+**Reading the story:**
+
+1. **Baseline (0.429).** The loop worked, but the agent reasoned from memory and got the historical figure wrong.
+2. **The single biggest win.** Adding *"do not answer from memory — fetch the underlying data and compute it"* flipped the final answer from YES to NO and drove the agent to actually retrieve the dataset. One prompt section, **+0.285** on that task.
+3. **Free speed.** `judge.py` computes `score = outcome_pct / 100` — the process rubric is graded and stored but never reaches the score. Skipping it is a 4× faster judge for zero information loss.
+4. **Concurrency is real.** Six concurrent Vibe sessions ran without Mistral rate-limiting, taking the suite from ~5.2 h to ~2.5 h.
+5. **Harness bugs cost score.** The agent wrote `answer.md` into a nested path, so the fallback used its chat reply — prose the rubric penalises.
+6. **Still leaking.** On a turn-limit exit Vibe writes the stop event to *stderr* and nothing to stdout, discarding the session. ~8% of runs score zero for this reason rather than for being wrong — worth **+0.024** on the mean.
+
+---
+
+## What it is
+
+Three domains of tools, exposed over MCP, all hitting live APIs.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Drug Discovery MCP Server                  │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐  │
-│  │   Database   │  │ Cheminform-  │  │  Structural Bio-   │  │
-│  │   Clients    │  │   atics      │  │    logy Tools      │  │
-│  └──────────────┘  └──────────────┘  └────────────────────┘  │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐  │
-│  │  Patent &     │  │  Target ID &  │  │   Task Management  │  │
-│  │ Literature    │  │  Genetics     │  │   & Evaluation     │  │
-│  └──────────────┘  └──────────────┘  └────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+        Mistral Vibe  (or any MCP client)
+                │
+                │  MCP · stdio / streamable-http / sse
+                ▼
+      ┌───────────────────────────────────┐
+      │     Drug Discovery MCP Server     │
+      ├───────────┬───────────┬───────────┤
+      │ Databases │   Chem-   │Structural │
+      │   (10)    │informatics│  biology  │
+      │           │   (10)    │   (10)    │
+      └───────────┴───────────┴───────────┘
+            │           │           │
+       UniProt       RDKit      Biopython
+       ChEMBL     descriptors   PDB parse
+       PDB        fingerprints  superpose
+       PubChem    similarity    RMSD
+       KEGG       drug-likeness binding site
+       NCBI       ADMET         contacts
+       OpenTargets conformers   SASA
 ```
 
-## Features
+**Databases** — `query_uniprot` `query_chembl` `query_pdb` `query_pubchem` `query_kegg` `query_ncbi` `query_opentargets` `search_compounds` `search_proteins` `search_patents`
 
-### Database Clients (Domain 1)
-- **UniProt**: Protein sequence, function, and annotation
-- **ChEMBL**: Bioactivity data and drug-like properties
-- **OpenTargets**: Target validation and disease association
-- **PDB**: Protein 3D structures
-- **KEGG**: Pathway and metabolic information
-- **PubChem**: Chemical compound database
-- **NCBI**: Genetic and genomic data
+**Cheminformatics** — `calculate_descriptors` `molecular_similarity` `calculate_fingerprint` `check_drug_likeness` `predict_admet` `smiles_to_inchi` `inchi_to_smiles` `generate_conformers` `optimize_geometry` `calculate_charge`
 
-### Cheminformatics (Domain 2)
-- Molecular descriptor calculation
-- SMILES/InChI conversion
-- Molecular similarity and clustering
-- ADMET property prediction
-- Drug-likeness scoring
-- Molecular fingerprinting
+**Structural biology** — `download_pdb` `parse_pdb` `superimpose_structures` `calculate_rmsd` `analyze_binding_site` `find_interactions` `analyze_conformation` `compare_structures` `extract_ligand` `analyze_solvent_accessibility`
 
-### Structural Biology (Domain 3)
-- PDB file parsing and manipulation
-- Structure superimposition and alignment
-- Binding site analysis
-- Molecular docking preparation
-- Protein-ligand interaction analysis
+Six more clients are built and tested — AlphaFold, Europe PMC, ClinicalTrials.gov, Reactome, ClinVar and GTEx — in [`databases/science.py`](drug_discovery_mcp/databases/science.py), pending registration.
 
-### Patent & Literature Mining (Domain 4)
-- Patent database searching
-- Scientific literature retrieval
-- Text mining and entity extraction
-- Citation network analysis
+---
 
-### Target Identification & Validation (Domain 5)
-- Gene-disease association analysis
-- Target tractability assessment
-- Genetic evidence evaluation
-- Pathway analysis
-
-### Hit Identification (Domain 6)
-- Virtual screening
-- Similarity searching
-- Pharmacophore matching
-- Database filtering
-
-### Hit-to-Lead & SAR (Domain 7)
-- Structure-activity relationship analysis
-- Lead optimization workflows
-- Bioisostere replacement
-- Scaffold hopping
-
-## Installation
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/harishsg993010/drug-design-agent.git
-cd drug-design-agent
+pip install -e ".[rdkit]"
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# stdio — what desktop MCP clients launch
+drug-discovery-mcp
 
-# Install dependencies
-pip install -e .
-
-# Install RDKit (required for cheminformatics)
-conda install -c conda-forge rdkit
-
-# Start the MCP server
-python -m drug_discovery_mcp.server
+# or over HTTP
+drug-discovery-mcp --transport streamable-http --port 8080
 ```
 
-## Usage
-
-### As MCP Server
+Register with **Mistral Vibe**:
 
 ```bash
-# Start server (default port 8080)
-python -m drug_discovery_mcp.server --port 8080
-
-# Or with custom configuration
-python -m drug_discovery_mcp.server --config config.json --log-level DEBUG
+vibe mcp add drug-discovery --transport stdio \
+  --command /path/to/drug-design-agent/.venv/bin/drug-discovery-mcp
 ```
 
-### Direct Python Usage
-
-```python
-from drug_discovery_mcp import DrugDiscoveryClient
-
-# Initialize client
-client = DrugDiscoveryClient()
-
-# Query UniProt
-protein_info = client.query_uniprot("P12345")
-
-# Calculate molecular descriptors
-from rdkit import Chem
-mol = Chem.MolFromSmiles("CCO")
-descriptors = client.calculate_descriptors(mol)
-
-# Search ChEMBL
-bioactivity = client.query_chembl("CHEMBL123")
+```
+> Call query_uniprot with accession P04637 and report the entry_name.
+entry_name: P53_HUMAN
 ```
 
-## Configuration
-
-Create a `config.json` file:
+With **Claude Desktop** or any MCP client:
 
 ```json
-{
-  "server": {
-    "host": "0.0.0.0",
-    "port": 8080,
-    "max_workers": 10,
-    "timeout": 300
-  },
-  "databases": {
-    "uniprot": {
-      "endpoint": "https://www.ebi.ac.uk/proteins/api",
-      "rate_limit": 10
-    },
-    "chembl": {
-      "endpoint": "https://www.ebi.ac.uk/chembl/api",
-      "rate_limit": 10
-    },
-    "pdb": {
-      "endpoint": "https://data.rcsb.org",
-      "rate_limit": 20
-    }
-  },
-  "cache": {
-    "enabled": true,
-    "directory": "./cache",
-    "expiry_days": 7
-  },
-  "logging": {
-    "level": "INFO",
-    "file": "./logs/server.log"
-  }
-}
+{ "mcpServers": { "drug-discovery": { "command": "drug-discovery-mcp" } } }
 ```
 
-## API Reference
+A REST/OpenAPI interface over the same tools — *not* MCP — runs as `drug-discovery-mcp-http`.
 
-### Database Tools
+---
 
-#### `query_uniprot(accession: str) -> dict`
-Query UniProt database for protein information.
+## Running the benchmark
 
-**Parameters:**
-- `accession`: UniProt accession number (e.g., "P12345")
+DrugDiscoveryBench ships 82 tasks whose rubrics live in a gated HuggingFace dataset. Populate them first, or every task scores zero.
 
-**Returns:**
-```json
-{
-  "accession": "P12345",
-  "entry_name": "PROTEIN_HUMAN",
-  "protein_name": "Example protein",
-  "gene_name": "EXPG",
-  "organism": "Homo sapiens",
-  "sequence": "MA...",
-  "function": "Example function",
-  "pathways": [...],
-  "go_annotations": [...],
-  "diseases": [...]
-}
+```bash
+git clone https://github.com/scaleapi/DrugDiscoveryBench.git
+cd DrugDiscoveryBench && PYTHONUTF8=1 python scripts/populate_rubrics.py
 ```
 
-#### `query_chembl(compound_id: str) -> dict`
-Query ChEMBL database for compound bioactivity data.
+**Without Docker** — each task's `judge.py` is a standalone rubric judge, so Vibe answers on the host with the MCP tools registered and the task's own judge scores it:
 
-**Parameters:**
-- `compound_id`: ChEMBL compound ID (e.g., "CHEMBL123")
-
-**Returns:**
-```json
-{
-  "compound_id": "CHEMBL123",
-  "smiles": "CCO",
-  "molecular_weight": 46.07,
-  "logp": 0.32,
-  "targets": [...],
-  "assays": [...],
-  "bioactivities": [...]
-}
+```bash
+export MISTRAL_API_KEY=...
+python integrations/run_task_local.py 69b025e20c10fe76b7aaf812   # one task
+python integrations/run_all_local.py --workers 6                 # all 82
+python integrations/run_all_local.py --summary-only              # scores
 ```
 
-#### `query_pdb(pdb_id: str) -> dict`
-Query PDB database for protein structure information.
+**With Docker** — the official Harbor harness. Harbor ships agent adapters for Claude Code, Codex and Gemini CLI but **not Vibe**, so [`integrations/vibe_agent.py`](integrations/vibe_agent.py) supplies one: it installs Vibe in the trial container, registers MCP servers via `vibe mcp add`, and converts Vibe's transcript into Harbor's ATIF trajectory format. Harbor has first-class MCP support, so our tools drop into a trial through `task.toml` with no fork:
 
-**Parameters:**
-- `pdb_id`: PDB ID (e.g., "1ABC")
-
-**Returns:**
-```json
-{
-  "pdb_id": "1ABC",
-  "title": "Structure of example protein",
-  "resolution": 1.8,
-  "method": "X-RAY DIFFRACTION",
-  "chains": [...],
-  "ligands": [...],
-  "experimental_data": {...}
-}
+```bash
+python integrations/add_mcp_to_tasks.py /path/to/DrugDiscoveryBench
+MISTRAL_API_KEY=... ./integrations/run_vibe_task.sh <task_id>
 ```
 
-### Cheminformatics Tools
+Results land in `local_runs/<task_id>/` — `answer.md`, the Vibe transcript, `reward.json` (0–1) and `grades_detail.json` (per-criterion breakdown).
 
-#### `calculate_descriptors(smiles: str) -> dict`
-Calculate molecular descriptors for a SMILES string.
+---
 
-**Parameters:**
-- `smiles`: SMILES string (e.g., "CCO")
+## Repository layout
 
-**Returns:**
-```json
-{
-  "smiles": "CCO",
-  "molecular_weight": 46.07,
-  "logp": 0.32,
-  "hba": 1,
-  "hbd": 0,
-  "tpsa": 20.23,
-  "rotatable_bonds": 0,
-  "heavy_atoms": 2,
-  "aromatic_rings": 0,
-  "fraction_csp3": 0.0,
-  "qed": 0.99
-}
+```
+drug_discovery_mcp/
+  mcp_server.py            # the MCP server — 30 tools, stdio/HTTP/SSE
+  server.py                # REST/OpenAPI interface over the same tools
+  databases/               # UniProt, ChEMBL, PDB, PubChem, KEGG, NCBI, OpenTargets
+    science.py             #   + AlphaFold, EuropePMC, ClinicalTrials, Reactome,
+                           #     ClinVar, GTEx  (built, pending registration)
+  cheminformatics/         # RDKit: descriptors, fingerprints, ADMET, drug-likeness
+  structural_biology/      # Biopython: parsing, superposition, binding sites
+  tasks/                   # task runner + rubric evaluation
+integrations/
+  run_task_local.py        # Docker-free: Vibe answers → the task's judge grades
+  run_all_local.py         # sweeps all 82, resumable, concurrent
+  vibe_agent.py            # Harbor agent adapter for Mistral Vibe
+  add_mcp_to_tasks.py      # stamps the MCP server into task.toml
+tests/                     # 151 tests
 ```
 
-#### `smiles_to_inchi(smiles: str) -> dict`
-Convert SMILES to InChI and InChIKey.
+---
 
-**Parameters:**
-- `smiles`: SMILES string
+## Reproduce
 
-**Returns:**
-```json
-{
-  "smiles": "CCO",
-  "inchi": "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3",
-  "inchikey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
-}
+```bash
+pytest                                                    # 151 tests
+python integrations/run_all_local.py --workers 6          # the full sweep
+python integrations/update_readme_scores.py               # refresh the results block
+
+# Harbor adapter tests (Harbor requires Python 3.12+)
+uv tool run --with pytest --from harbor==0.13.1 pytest integrations/
 ```
 
-#### `molecular_similarity(smiles1: str, smiles2: str, metric: str = "tanimoto") -> float`
-Calculate molecular similarity between two SMILES strings.
+---
 
-**Parameters:**
-- `smiles1`: First SMILES string
-- `smiles2`: Second SMILES string
-- `metric`: Similarity metric ("tanimoto", "dice", "cosine")
-
-**Returns:**
-```json
-{
-  "similarity": 0.85,
-  "metric": "tanimoto",
-  "fingerprint_type": "morgan"
-}
-```
-
-### Structural Biology Tools
-
-#### `superimpose_structures(pdb_id1: str, pdb_id2: str) -> dict`
-Superimpose two protein structures and calculate RMSD.
-
-**Parameters:**
-- `pdb_id1`: First PDB ID
-- `pdb_id2`: Second PDB ID
-
-**Returns:**
-```json
-{
-  "pdb_id1": "1ABC",
-  "pdb_id2": "2DEF",
-  "rmsd": 1.2,
-  "aligned_residues": 200,
-  "transformation_matrix": [...],
-  "residue_differences": [...]
-}
-```
-
-#### `analyze_binding_site(pdb_id: str, chain: str, residue: str) -> dict`
-Analyze binding site interactions for a specific residue.
-
-**Parameters:**
-- `pdb_id`: PDB ID
-- `chain`: Chain identifier
-- `residue`: Residue number
-
-**Returns:**
-```json
-{
-  "pdb_id": "1ABC",
-  "chain": "A",
-  "residue": "58",
-  "residue_type": "THR",
-  "interactions": [
-    {
-      "type": "hydrogen_bond",
-      "partner": "LIG1",
-      "distance": 2.8,
-      "angle": 165.5
-    }
-  ],
-  "accessibility": 0.45,
-  "conformation": "extended"
-}
-```
-
-## Task System
-
-The server includes a task management system for running DrugDiscoveryBench-style tasks:
-
-### Task Categories
-
-1. **Structural Reasoning** (19 tasks)
-   - Protein structure analysis
-   - Binding site comparison
-   - Conformational changes
-
-2. **Database Screening** (14 tasks)
-   - Compound database searching
-   - Bioactivity filtering
-   - Target identification
-
-3. **Patent Mining** (13 tasks)
-   - Patent text analysis
-   - Chemical entity extraction
-   - Prior art searching
-
-4. **Target ID & Genetics** (12 tasks)
-   - Gene-disease association
-   - Target validation
-   - Genetic evidence analysis
-
-5. **Cheminformatics** (10 tasks)
-   - Molecular property calculation
-   - Structure manipulation
-   - Drug-likeness assessment
-
-6. **SAR / Affinity Ranking** (7 tasks)
-   - Structure-activity relationship
-   - Binding affinity prediction
-   - Compound ranking
-
-7. **Molecular Biology** (7 tasks)
-   - Sequence analysis
-   - Protein function prediction
-   - Pathway analysis
-
-### Running Tasks
-
-```python
-from drug_discovery_mcp.tasks import TaskRunner
-
-# Initialize task runner
-runner = TaskRunner()
-
-# List available tasks
-tasks = runner.list_tasks()
-
-# Run a specific task
-result = runner.run_task("lead_optimization_kras_g12c")
-
-# Run with custom parameters
-result = runner.run_task(
-    "target_identification",
-    parameters={"gene": "TP53", "disease": "cancer"}
-)
-```
-
-## Evaluation System
-
-The server includes a rubric-based evaluation system for grading task outputs:
-
-```python
-from drug_discovery_mcp.evaluation import Evaluator
-
-evaluator = Evaluator()
-
-# Evaluate a task result
-score = evaluator.evaluate(
-    task_id="lead_optimization_kras_g12c",
-    answer={"residue": "THR58"},
-    rubric=[
-        {"criterion": "correct_residue", "weight": 30, "expected": "THR58"},
-        {"criterion": "process_check", "weight": 20, "expected": True},
-    ]
-)
-
-print(f"Score: {score['total']}%")
-print(f"Passed: {score['passed']}")
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-MIT License
-
-## Acknowledgments
-
-- Inspired by [DrugDiscoveryBench](https://github.com/scaleapi/DrugDiscoveryBench)
-- Built on [BIOMNI](https://github.com/snap-stanford/BIOMNI) framework
-- Uses [RDKit](https://www.rdkit.org/) for cheminformatics
-- MCP protocol from [Model Context Protocol](https://github.com/modelcontextprotocol)
-
-## Contact
-
-For questions or support, please open an issue on GitHub.
+<sub>MCP server on the official Python SDK · live UniProt / ChEMBL / PDB / PubChem / KEGG / NCBI / OpenTargets · RDKit + Biopython · evaluated with Mistral Vibe on DrugDiscoveryBench.</sub>

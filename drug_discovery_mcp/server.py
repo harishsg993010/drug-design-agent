@@ -78,7 +78,7 @@ class DrugDiscoveryMCPServer:
         
         self.app = FastAPI(
             title="Drug Discovery MCP Server",
-            description="MCP server for early-stage drug discovery tasks",
+            description="REST interface to the drug discovery toolset. For the Model Context Protocol, use drug_discovery_mcp.mcp_server.",
             version="0.1.0",
         )
         
@@ -150,7 +150,13 @@ class DrugDiscoveryMCPServer:
         
         @self.app.post("/mcp")
         async def handle_mcp_request(request: MCPRequest):
-            """Handle MCP protocol requests"""
+            """
+            Dispatch a tool by name (legacy JSON envelope)
+
+            This is not the Model Context Protocol. For MCP, run the server in
+            drug_discovery_mcp.mcp_server, which speaks the real protocol over
+            stdio and HTTP.
+            """
             return await self._handle_request(request)
         
         @self.app.post("/call/{tool_name}")
@@ -250,6 +256,18 @@ class DrugDiscoveryMCPServer:
         # Additional tool categories will be added here
         # Patent mining, Target identification, Hit identification, SAR analysis
     
+    @staticmethod
+    def _tool_error(result: Any) -> Optional[str]:
+        """
+        Read an error out of a tool result
+
+        Several tools report failure by returning {"error": ...} rather than
+        raising, so the envelope must not report those as successes.
+        """
+        if isinstance(result, dict) and result.get("error"):
+            return str(result["error"])
+        return None
+
     def _register_tool(self, name: str, func: Any, category: str, tags: List[str]):
         """Register a single tool"""
         self.tools[name] = func
@@ -293,11 +311,15 @@ class DrugDiscoveryMCPServer:
                 if asyncio.iscoroutinefunction(func):
                     result = await func(**request.params)
                 else:
-                    result = func(**request.params)
+                    # Tool functions are blocking (network + RDKit), so keep
+                    # them off the event loop thread
+                    result = await asyncio.to_thread(lambda: func(**request.params))
                 
+                error = self._tool_error(result)
                 return MCPResponse(
                     id=request.id,
-                    success=True,
+                    success=error is None,
+                    error=error,
                     result=result
                 )
             except Exception as e:
@@ -328,9 +350,17 @@ class DrugDiscoveryMCPServer:
             if asyncio.iscoroutinefunction(func):
                 result = await func(**params)
             else:
-                result = func(**params)
+                # Tool functions are blocking (network + RDKit), so keep them
+                # off the event loop thread
+                result = await asyncio.to_thread(lambda: func(**params))
             
-            return {"result": result, "success": True, "tool": tool_name}
+            error = self._tool_error(result)
+            return {
+                "result": result,
+                "success": error is None,
+                "error": error,
+                "tool": tool_name,
+            }
             
         except Exception as e:
             logger.error(f"Tool call error {tool_name}: {e}")
@@ -375,26 +405,35 @@ class DrugDiscoveryMCPServer:
         """Run the server"""
         import uvicorn
         
+        # uvicorn only supports `reload` and `workers` when the app is given as
+        # an import string. We hand it a live instance (the tools are already
+        # registered on it), so those options must not be passed -- uvicorn
+        # refuses to start otherwise.
+        if self.config.server.debug or self.config.server.max_workers > 1:
+            logger.warning(
+                "reload/workers are not supported when serving a pre-built app "
+                "instance; running a single process"
+            )
+        
         uvicorn.run(
             self.app,
             host=self.host,
             port=self.port,
-            reload=self.config.server.debug,
-            workers=self.config.server.max_workers,
             timeout_keep_alive=self.config.server.timeout,
         )
     
     async def start_async(self):
         """Start the server asynchronously"""
+        import uvicorn
+        
         config = uvicorn.Config(
             self.app,
             host=self.host,
             port=self.port,
-            reload=self.config.server.debug,
-            workers=self.config.server.max_workers,
+            timeout_keep_alive=self.config.server.timeout,
         )
         server = uvicorn.Server(config)
-        await server.start()
+        await server.serve()
 
 
 def main():

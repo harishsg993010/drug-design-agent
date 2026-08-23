@@ -257,11 +257,10 @@ class FingerprintTools(CheminformaticsBase):
         Chem = self._get_rdkit()
         
         # Generate Morgan fingerprint
-        fp = Chem.GetMorganFingerprintAsBitVect(
+        fp = Chem.rdMolDescriptors.GetMorganFingerprintAsBitVect(
             mol,
-            radius=radius,
-            nBits=bit_length,
-            bitInfo={}
+            radius,
+            nBits=bit_length
         )
         
         # Convert to list of bits
@@ -282,12 +281,11 @@ class FingerprintTools(CheminformaticsBase):
         Chem = self._get_rdkit()
         
         # Generate atom pair fingerprint
-        fp = Chem.GetAtomPairFingerprintAsBitVect(
+        fp = Chem.rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(
             mol,
             nBits=bit_length,
             minLength=1,
-            maxLength=30,
-            bitInfo={}
+            maxLength=30
         )
         
         # Convert to list of bits
@@ -298,10 +296,9 @@ class FingerprintTools(CheminformaticsBase):
         Chem = self._get_rdkit()
         
         # Generate topological torsion fingerprint
-        fp = Chem.GetTopologicalTorsionFingerprintAsBitVect(
+        fp = Chem.rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(
             mol,
-            nBits=bit_length,
-            bitInfo={}
+            nBits=bit_length
         )
         
         # Convert to list of bits
@@ -312,10 +309,10 @@ class FingerprintTools(CheminformaticsBase):
         Chem = self._get_rdkit()
         
         # Generate MACCS keys
-        fp = Chem.GetMACCSKeysFingerprint(mol)
+        fp = Chem.rdMolDescriptors.GetMACCSKeysFingerprint(mol)
         
-        # Convert to list of bits (MACCS is 166 bits)
-        return [1 if fp.GetBit(i) else 0 for i in range(166)]
+        # Convert to list of bits (MACCS keys are 167 bits; bit 0 is unused)
+        return [1 if fp.GetBit(i) else 0 for i in range(fp.GetNumBits())]
 
 
 # Singleton instance

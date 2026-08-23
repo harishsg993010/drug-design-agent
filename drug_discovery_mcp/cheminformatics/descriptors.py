@@ -199,7 +199,7 @@ class DescriptorCalculator(CheminformaticsBase):
     def _calculate_molecular_weight(self, mol: Any) -> float:
         """Calculate molecular weight"""
         Chem = self._get_rdkit()
-        return Chem.rdMolDescriptor.CalcExactMolWt(mol)
+        return Chem.rdMolDescriptors.CalcExactMolWt(mol)
     
     def _calculate_logp(self, mol: Any) -> float:
         """Calculate octanol/water partition coefficient (logP)"""
@@ -227,7 +227,7 @@ class DescriptorCalculator(CheminformaticsBase):
     def _calculate_tpsa(self, mol: Any) -> float:
         """Calculate topological polar surface area"""
         Chem = self._get_rdkit()
-        return Chem.rdMolDescriptor.CalcTPSA(mol)
+        return Chem.rdMolDescriptors.CalcTPSA(mol)
     
     def _calculate_rotatable_bonds(self, mol: Any) -> int:
         """Calculate number of rotatable bonds"""
@@ -237,7 +237,7 @@ class DescriptorCalculator(CheminformaticsBase):
     def _calculate_heavy_atoms(self, mol: Any) -> int:
         """Calculate number of heavy atoms (non-hydrogen)"""
         Chem = self._get_rdkit()
-        return Chem.rdMolDescriptor.CalcNumHeavyAtoms(mol)
+        return Chem.rdMolDescriptors.CalcNumHeavyAtoms(mol)
     
     def _calculate_aromatic_rings(self, mol: Any) -> int:
         """Calculate number of aromatic rings"""
@@ -252,7 +252,7 @@ class DescriptorCalculator(CheminformaticsBase):
     def _calculate_num_heteroatoms(self, mol: Any) -> int:
         """Calculate number of heteroatoms (non-carbon, non-hydrogen)"""
         Chem = self._get_rdkit()
-        return Chem.rdMolDescriptor.CalcNumHeteroAtoms(mol)
+        return Chem.rdMolDescriptors.CalcNumHeteroatoms(mol)
     
     def _calculate_num_aromatic_rings(self, mol: Any) -> int:
         """Calculate number of aromatic rings"""
@@ -261,16 +261,16 @@ class DescriptorCalculator(CheminformaticsBase):
     def _calculate_num_saturated_rings(self, mol: Any) -> int:
         """Calculate number of saturated rings"""
         Chem = self._get_rdkit()
-        return Chem.rdMolDescriptor.CalcNumSaturatedRings(mol)
+        return Chem.rdMolDescriptors.CalcNumSaturatedRings(mol)
     
     def _calculate_num_rotatable_bonds(self, mol: Any) -> int:
         """Calculate number of rotatable bonds"""
         return self._calculate_rotatable_bonds(mol)
     
     def _calculate_num_hydrogens(self, mol: Any) -> int:
-        """Calculate number of hydrogen atoms"""
-        Chem = self._get_rdkit()
-        return Chem.rdMolDescriptor.CalcNumHBA(mol) + Chem.rdMolDescriptor.CalcNumHBD(mol)
+        """Calculate number of hydrogen atoms (implicit + explicit)"""
+        self._get_rdkit()
+        return sum(atom.GetTotalNumHs() for atom in mol.GetAtoms())
     
     def _calculate_num_carbons(self, mol: Any) -> int:
         """Calculate number of carbon atoms"""
@@ -341,7 +341,7 @@ class DescriptorCalculator(CheminformaticsBase):
         violations = 0
         
         # Molecular weight > 500
-        if Chem.rdMolDescriptor.CalcExactMolWt(mol) > 500:
+        if Chem.rdMolDescriptors.CalcExactMolWt(mol) > 500:
             violations += 1
         
         # logP > 5
@@ -366,7 +366,7 @@ class DescriptorCalculator(CheminformaticsBase):
         """Calculate molar refractivity"""
         Chem = self._get_rdkit()
         try:
-            return Chem.rdMolDescriptor.CalcMolarRefractivity(mol)
+            return Chem.Crippen.MolMR(mol)
         except Exception as e:
             logger.warning(f"Failed to calculate molar refractivity: {e}")
             return None

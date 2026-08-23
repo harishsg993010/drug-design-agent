@@ -516,10 +516,12 @@ class PDBParser(StructuralBiologyBase):
         
         # Extract header information
         if structure.header:
+            # Biopython exposes the header as a plain dict
+            header = structure.header
             pdb_structure.header = {
-                "classification": structure.header.classification,
-                "deposition_date": str(structure.header.deposition_date),
-                "id_code": structure.header.id_code
+                "classification": header.get("head", ""),
+                "deposition_date": str(header.get("deposition_date", "")),
+                "id_code": header.get("idcode", "")
             }
         
         # Extract chains, residues, and atoms
@@ -615,9 +617,14 @@ def download_pdb(pdb_id: str, format: str = "pdb", cache_dir: Optional[Path] = N
     Returns:
         Path to the downloaded file
     """
+    from ..databases.base import DatabaseError
     from ..databases.pdb import PDBClient
     client = PDBClient()
-    return client.download_pdb_file(pdb_id, format)
+    try:
+        return client.download_pdb_file(pdb_id, format)
+    except DatabaseError as e:
+        # Don't leak the database layer's exception type out of this API
+        raise StructuralBiologyError(f"Failed to download PDB file {pdb_id}: {e}")
 
 
 def parse_pdb(pdb_id: str, file_path: Optional[str] = None, **kwargs) -> Dict[str, Any]:
@@ -632,6 +639,8 @@ def parse_pdb(pdb_id: str, file_path: Optional[str] = None, **kwargs) -> Dict[st
     Returns:
         Dictionary with parsed structure
     """
+    from ..databases.base import DatabaseError
+    
     try:
         if file_path:
             structure = _pdb_parser.parse_file(file_path)
@@ -642,7 +651,7 @@ def parse_pdb(pdb_id: str, file_path: Optional[str] = None, **kwargs) -> Dict[st
         
         return structure.to_dict()
         
-    except StructuralBiologyError as e:
+    except (StructuralBiologyError, DatabaseError) as e:
         return {"error": str(e), "pdb_id": pdb_id}
 
 

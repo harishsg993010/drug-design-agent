@@ -9,7 +9,14 @@ It includes:
 - Task validation and grading
 """
 
-from .task import Task, TaskCategory, TaskStatus
+from .task import (
+    Task,
+    TaskCategory,
+    TaskStatus,
+    TaskDifficulty,
+    TaskResult,
+    create_example_tasks,
+)
 from .runner import TaskRunner
 from .registry import TaskRegistry
 from .evaluation import TaskEvaluator
@@ -18,6 +25,9 @@ __all__ = [
     "Task",
     "TaskCategory",
     "TaskStatus",
+    "TaskDifficulty",
+    "TaskResult",
+    "create_example_tasks",
     "TaskRunner",
     "TaskRegistry",
     "TaskEvaluator",

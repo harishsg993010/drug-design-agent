@@ -92,11 +92,20 @@ class StructureAlignment(StructuralBiologyBase):
             structure2 = self.pdb_parser.parse_string(self._download_pdb(pdb_id2), pdb_id2)
             
             # Get atoms for alignment
-            atoms1, coords1 = self._get_atoms_for_alignment(structure1, chain_id1, atom_selection)
-            atoms2, coords2 = self._get_atoms_for_alignment(structure2, chain_id2, atom_selection)
-            
-            if len(coords1) == 0 or len(coords2) == 0:
+            atoms1, _ = self._get_atoms_for_alignment(structure1, chain_id1, atom_selection)
+            atoms2, _ = self._get_atoms_for_alignment(structure2, chain_id2, atom_selection)
+
+            if not atoms1 or not atoms2:
                 raise StructuralBiologyError("No atoms found for alignment")
+
+            # Kabsch needs point-to-point correspondence, so align on the atoms
+            # the two structures have in common rather than on raw ordering
+            atoms1, coords1, atoms2, coords2 = self._pair_atoms(atoms1, atoms2)
+
+            if len(coords1) == 0:
+                raise StructuralBiologyError(
+                    "Structures share no common residues to align on"
+                )
             
             # Align structures using Kabsch algorithm
             rmsd, rotation, translation = self._kabsch_align(coords1, coords2)
@@ -204,35 +213,71 @@ class StructureAlignment(StructuralBiologyBase):
         atoms = []
         coords = []
         
-        # Get the specified chain or first chain
-        target_chain = None
+        # Pick the requested chain, or the first chain that actually yields
+        # atoms for this selection. Taking chains[0] blindly picks up nucleic
+        # acid or solvent chains, which have no CA/backbone atoms at all.
         if chain_id:
-            for chain in structure.chains:
-                if chain.chain_id == chain_id:
-                    target_chain = chain
-                    break
+            candidates = [c for c in structure.chains if c.chain_id == chain_id]
         else:
-            if structure.chains:
-                target_chain = structure.chains[0]
-        
-        if not target_chain:
-            return atoms, np.array(coords)
-        
-        # Select atoms based on atom_selection
-        for residue in target_chain.residues:
+            candidates = list(structure.chains)
+
+        for chain in candidates:
+            atoms = self._select_atoms(chain, atom_selection)
+            if atoms:
+                coords = [[a.x, a.y, a.z] for a in atoms]
+                return atoms, np.array(coords)
+
+        return [], np.empty((0, 3))
+
+    @staticmethod
+    def _select_atoms(chain: Any, atom_selection: str) -> List[Any]:
+        """Collect the atoms of one chain matching an atom selection"""
+        selected = []
+
+        for residue in chain.residues:
             for atom in residue.atoms:
-                if atom_selection == "ca" and atom.atom_name.strip() == "CA":
-                    atoms.append(atom)
-                    coords.append([atom.x, atom.y, atom.z])
-                elif atom_selection == "backbone":
-                    if atom.atom_name.strip() in ["N", "CA", "C", "O"]:
-                        atoms.append(atom)
-                        coords.append([atom.x, atom.y, atom.z])
+                name = atom.atom_name.strip()
+                if atom_selection == "ca" and name == "CA":
+                    selected.append(atom)
+                elif atom_selection == "backbone" and name in ("N", "CA", "C", "O"):
+                    selected.append(atom)
                 elif atom_selection == "all":
-                    atoms.append(atom)
-                    coords.append([atom.x, atom.y, atom.z])
-        
-        return atoms, np.array(coords)
+                    selected.append(atom)
+
+        return selected
+
+    @staticmethod
+    def _pair_atoms(
+        atoms1: List[Any],
+        atoms2: List[Any]
+    ) -> Tuple[List[Any], np.ndarray, List[Any], np.ndarray]:
+        """
+        Match two atom lists into corresponding pairs
+
+        Atoms are keyed on (residue number, insertion code, atom name) so that
+        structures of different lengths still align on their shared residues.
+
+        Returns:
+            Tuple of (atoms1, coords1, atoms2, coords2), all in matching order
+        """
+        def key(atom):
+            return (atom.residue_number, atom.insertion_code.strip(), atom.atom_name.strip())
+
+        lookup2 = {}
+        for atom in atoms2:
+            lookup2.setdefault(key(atom), atom)
+
+        paired1, paired2 = [], []
+        for atom in atoms1:
+            match = lookup2.get(key(atom))
+            if match is not None:
+                paired1.append(atom)
+                paired2.append(match)
+
+        coords1 = np.array([[a.x, a.y, a.z] for a in paired1]) if paired1 else np.empty((0, 3))
+        coords2 = np.array([[a.x, a.y, a.z] for a in paired2]) if paired2 else np.empty((0, 3))
+
+        return paired1, coords1, paired2, coords2
     
     def _kabsch_align(self, coords1: np.ndarray, coords2: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
         """
@@ -272,8 +317,9 @@ class StructureAlignment(StructuralBiologyBase):
         
         # Calculate translation vector
         translation = centroid1 - np.dot(rotation, centroid2)
-        
-        return rmsd, rotation, translation
+
+        # Cast to a builtin float -- numpy scalars are not JSON serializable
+        return float(rmsd), rotation, translation
     
     def _apply_transformation(self, coords: np.ndarray, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
         """Apply rotation and translation to coordinates"""

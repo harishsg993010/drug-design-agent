@@ -19,6 +19,7 @@ __author__ = "Harish G"
 __email__ = "harishsg993010@gmail.com"
 
 # Import core modules
+from .mcp_server import build_server
 from .server import DrugDiscoveryMCPServer
 from .client import DrugDiscoveryClient
 from .config import settings, DrugDiscoveryConfig
@@ -27,20 +28,20 @@ from .config import settings, DrugDiscoveryConfig
 from . import databases
 from . import cheminformatics
 from . import structural_biology
-from . import patent_mining
-from . import target_identification
-from . import hit_identification
-from . import sar_analysis
+
+# NOTE: patent_mining, target_identification, hit_identification and sar_analysis
+# are not implemented yet; they will be re-exported here once they land.
 
 # Import task system
 from .tasks import TaskRunner, Task
-from .evaluation import Evaluator, Rubric, RubricCriterion
+from .tasks.evaluation import TaskEvaluator, RubricCriterion, RubricSection
 
 __all__ = [
     # Core
     "__version__",
     "__author__",
     "__email__",
+    "build_server",
     "DrugDiscoveryMCPServer",
     "DrugDiscoveryClient",
     "settings",
@@ -49,14 +50,10 @@ __all__ = [
     "databases",
     "cheminformatics",
     "structural_biology",
-    "patent_mining",
-    "target_identification",
-    "hit_identification",
-    "sar_analysis",
     # Task system
     "TaskRunner",
     "Task",
-    "Evaluator",
-    "Rubric",
+    "TaskEvaluator",
     "RubricCriterion",
+    "RubricSection",
 ]

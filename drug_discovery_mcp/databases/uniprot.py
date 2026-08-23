@@ -81,7 +81,7 @@ class UniProtClient(DatabaseClient):
     def get_default_config(cls) -> DatabaseConfig:
         """Get default UniProt configuration"""
         return DatabaseConfig(
-            endpoint="https://www.ebi.ac.uk/proteins/api",
+            endpoint="https://rest.uniprot.org/uniprotkb",
             rate_limit=10,
             timeout=30,
             retries=3,
@@ -117,7 +117,7 @@ class UniProtClient(DatabaseClient):
         Raises:
             DatabaseError: If the query fails
         """
-        url = f"{self.config.endpoint}/proteins/{accession}"
+        url = f"{self.config.endpoint}/{accession}"
         
         if fields:
             url += f"?fields={','.join(fields)}"
@@ -135,7 +135,7 @@ class UniProtClient(DatabaseClient):
         limit: int = 10,
         offset: int = 0,
         fields: Optional[List[str]] = None,
-        sort: str = "score"
+        sort: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Search UniProt database
@@ -150,23 +150,31 @@ class UniProtClient(DatabaseClient):
         Returns:
             Dictionary with search results
         """
-        url = f"{self.config.endpoint}/proteins"
-        
+        url = f"{self.config.endpoint}/search"
+
+        # UniProt paginates by cursor, not offset, so fetch through the offset
+        # and slice locally.
         params = {
             "query": query,
-            "limit": limit,
-            "offset": offset,
-            "sort": sort
+            "size": min(500, offset + limit),
         }
-        
+
+        # The API rejects an unknown sort field; "score" means relevance, which
+        # is already the default ordering, so it is simply omitted.
+        if sort and sort != "score":
+            params["sort"] = sort
+
         if fields:
             params["fields"] = ",".join(fields)
-        
+
         try:
-            data = self._make_request("GET", url, params=params)
+            response = self._request_raw("GET", url, params=params)
+            data = response.json()
+            results = data.get("results", [])[offset:offset + limit]
+
             return {
-                "results": [self._parse_entry_summary(item) for item in data.get("results", [])],
-                "total": data.get("total", 0),
+                "results": [self._parse_entry_summary(item) for item in results],
+                "total": int(response.headers.get("X-Total-Results", len(results))),
                 "limit": limit,
                 "offset": offset,
                 "query": query
@@ -185,11 +193,9 @@ class UniProtClient(DatabaseClient):
         Returns:
             Protein sequence as string
         """
-        url = f"{self.config.endpoint}/proteins/{accession}/sequence"
-        
         try:
-            data = self._make_request("GET", url)
-            return data.get("sequence", "")
+            entry = self._make_request("GET", f"{self.config.endpoint}/{accession}")
+            return (entry.get("sequence") or {}).get("value", "")
         except Exception as e:
             logger.error(f"Failed to get sequence for {accession}: {e}")
             raise DatabaseError(f"Failed to get sequence: {e}")
@@ -204,16 +210,9 @@ class UniProtClient(DatabaseClient):
         Returns:
             List of GO annotations
         """
-        url = f"{self.config.endpoint}/proteins/{accession}/annotations"
-        
         try:
-            data = self._make_request("GET", url)
-            # Filter for GO annotations
-            go_annotations = []
-            for annotation in data.get("results", []):
-                if annotation.get("type") == "Gene Ontology":
-                    go_annotations.append(annotation)
-            return go_annotations
+            entry = self._make_request("GET", f"{self.config.endpoint}/{accession}")
+            return self._extract_go_annotations(entry)
         except Exception as e:
             logger.error(f"Failed to get GO annotations for {accession}: {e}")
             raise DatabaseError(f"Failed to get GO annotations: {e}")
@@ -228,11 +227,9 @@ class UniProtClient(DatabaseClient):
         Returns:
             List of pathway annotations
         """
-        url = f"{self.config.endpoint}/proteins/{accession}/pathways"
-        
         try:
-            data = self._make_request("GET", url)
-            return data.get("results", [])
+            entry = self._make_request("GET", f"{self.config.endpoint}/{accession}")
+            return self._extract_pathways(entry)
         except Exception as e:
             logger.error(f"Failed to get pathways for {accession}: {e}")
             raise DatabaseError(f"Failed to get pathways: {e}")
@@ -247,11 +244,9 @@ class UniProtClient(DatabaseClient):
         Returns:
             List of disease annotations
         """
-        url = f"{self.config.endpoint}/proteins/{accession}/diseases"
-        
         try:
-            data = self._make_request("GET", url)
-            return data.get("results", [])
+            entry = self._make_request("GET", f"{self.config.endpoint}/{accession}")
+            return self._extract_diseases(entry)
         except Exception as e:
             logger.error(f"Failed to get diseases for {accession}: {e}")
             raise DatabaseError(f"Failed to get diseases: {e}")
@@ -266,11 +261,9 @@ class UniProtClient(DatabaseClient):
         Returns:
             List of protein interactions
         """
-        url = f"{self.config.endpoint}/proteins/{accession}/interactions"
-        
         try:
-            data = self._make_request("GET", url)
-            return data.get("results", [])
+            entry = self._make_request("GET", f"{self.config.endpoint}/{accession}")
+            return self._extract_interactions(entry)
         except Exception as e:
             logger.error(f"Failed to get interactions for {accession}: {e}")
             raise DatabaseError(f"Failed to get interactions: {e}")
@@ -285,73 +278,192 @@ class UniProtClient(DatabaseClient):
         Returns:
             List of keywords
         """
-        url = f"{self.config.endpoint}/proteins/{accession}/keywords"
-        
         try:
-            data = self._make_request("GET", url)
-            return [kw.get("value") for kw in data.get("results", [])]
+            entry = self._make_request("GET", f"{self.config.endpoint}/{accession}")
+            return self._extract_keywords(entry)
         except Exception as e:
             logger.error(f"Failed to get keywords for {accession}: {e}")
             raise DatabaseError(f"Failed to get keywords: {e}")
     
+    @staticmethod
+    def _protein_name(data: Dict[str, Any]) -> str:
+        """Read the recommended (or first submitted) protein name"""
+        description = data.get("proteinDescription", {}) or {}
+        recommended = description.get("recommendedName") or {}
+        name = (recommended.get("fullName") or {}).get("value")
+        if name:
+            return name
+
+        submitted = description.get("submissionNames") or []
+        if submitted:
+            return (submitted[0].get("fullName") or {}).get("value", "")
+        return ""
+
+    @staticmethod
+    def _gene_names(data: Dict[str, Any]) -> List[str]:
+        """Collect gene names and their synonyms"""
+        names = []
+        for gene in data.get("genes", []) or []:
+            primary = (gene.get("geneName") or {}).get("value")
+            if primary and primary not in names:
+                names.append(primary)
+            for synonym in gene.get("synonyms", []) or []:
+                value = synonym.get("value")
+                if value and value not in names:
+                    names.append(value)
+        return names
+
     def _parse_entry(self, data: Dict[str, Any]) -> UniProtEntry:
         """Parse UniProt entry data into UniProtEntry object"""
-        db_references = data.get("dbReferences", [])
-        
-        # Extract gene names
-        gene_names = []
-        for ref in db_references:
-            if ref.get("type") == "GeneID" or ref.get("type") == "GenBank":
-                gene_names.extend(ref.get("properties", []))
-        
-        # Extract sequence
-        sequence = ""
-        if "sequence" in data:
-            sequence = data["sequence"].get("sequence", "")
-        elif "sequences" in data and len(data["sequences"]) > 0:
-            sequence = data["sequences"][0].get("sequence", "")
-        
+        organism = data.get("organism", {}) or {}
+        sequence_block = data.get("sequence", {}) or {}
+        sequence = sequence_block.get("value", "")
+
         return UniProtEntry(
-            accession=data.get("accession", data.get("primaryAccession", "")),
-            entry_name=data.get("entryName", ""),
-            protein_name=data.get("protein", {}).get("recommendedName", {}).get("fullName", {}).get("value", ""),
-            gene_names=gene_names,
-            organism=data.get("organism", {}).get("scientificName", ""),
-            organism_id=data.get("organism", {}).get("taxonId", 0),
-            taxonomy=data.get("organism", {}).get("lineage", []),
+            accession=data.get("primaryAccession", ""),
+            entry_name=data.get("uniProtkbId", ""),
+            protein_name=self._protein_name(data),
+            gene_names=self._gene_names(data),
+            organism=organism.get("scientificName", ""),
+            organism_id=organism.get("taxonId", 0),
+            taxonomy=organism.get("lineage", []) or [],
             sequence=sequence,
-            length=len(sequence),
-            molecular_weight=data.get("protein", {}).get("molecularWeight", None),
-            pi=data.get("protein", {}).get("pi", None),
+            length=sequence_block.get("length", len(sequence)),
+            molecular_weight=sequence_block.get("molWeight"),
+            pi=None,  # UniProt does not publish isoelectric point
             function=self._extract_function(data),
-            pathways=data.get("pathways", []),
-            go_annotations=data.get("goAnnotations", []),
-            keywords=data.get("keywords", []),
-            features=data.get("features", []),
-            diseases=data.get("diseases", []),
-            interactions=data.get("interactions", []),
-            references=data.get("references", [])
+            pathways=self._extract_pathways(data),
+            go_annotations=self._extract_go_annotations(data),
+            keywords=self._extract_keywords(data),
+            features=data.get("features", []) or [],
+            diseases=self._extract_diseases(data),
+            interactions=self._extract_interactions(data),
+            references=data.get("references", []) or []
         )
-    
+
     def _parse_entry_summary(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Parse a summary entry from search results"""
         return {
             "accession": data.get("primaryAccession", ""),
-            "entry_name": data.get("entryName", ""),
-            "protein_name": data.get("protein", {}).get("recommendedName", {}).get("fullName", {}).get("value", ""),
-            "gene_names": data.get("genes", [{}])[0].get("geneName", {}).get("value", ""),
-            "organism": data.get("organism", {}).get("scientificName", ""),
-            "score": data.get("score", 0),
-            "length": data.get("sequence", {}).get("length", 0)
+            "entry_name": data.get("uniProtkbId", ""),
+            "protein_name": self._protein_name(data),
+            "gene_names": self._gene_names(data),
+            "organism": (data.get("organism", {}) or {}).get("scientificName", ""),
+            "length": (data.get("sequence", {}) or {}).get("length", 0),
+            "annotation_score": data.get("annotationScore"),
         }
-    
+
+    @staticmethod
+    def _comment_texts(comment: Dict[str, Any]) -> str:
+        """Join the free-text blocks of a comment into one string"""
+        return " ".join(
+            t.get("value", "") for t in comment.get("texts", []) or [] if t.get("value")
+        )
+
     def _extract_function(self, data: Dict[str, Any]) -> Optional[str]:
         """Extract protein function from annotations"""
-        comments = data.get("comments", [])
-        for comment in comments:
-            if comment.get("type") == "FUNCTION":
-                return comment.get("text", [{}])[0].get("value", "")
+        for comment in data.get("comments", []) or []:
+            if comment.get("commentType") == "FUNCTION":
+                text = self._comment_texts(comment)
+                if text:
+                    return text
         return None
+
+    def _extract_diseases(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract disease associations from DISEASE comments
+
+        A DISEASE comment carries a named disease, a free-text note, or both;
+        the note lives under ``note.texts`` rather than directly on the comment.
+        """
+        diseases = []
+        for comment in data.get("comments", []) or []:
+            if comment.get("commentType") != "DISEASE":
+                continue
+
+            disease = comment.get("disease") or {}
+            note = self._comment_texts(comment.get("note") or {})
+
+            if not disease and not note:
+                continue
+
+            diseases.append({
+                "disease_id": disease.get("diseaseId"),
+                "disease_accession": disease.get("diseaseAccession"),
+                "acronym": disease.get("acronym"),
+                "description": disease.get("description"),
+                "cross_reference": disease.get("diseaseCrossReference"),
+                "note": note or None,
+            })
+        return diseases
+
+    def _extract_interactions(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract binary interactions from INTERACTION comments"""
+        interactions = []
+        for comment in data.get("comments", []) or []:
+            if comment.get("commentType") != "INTERACTION":
+                continue
+            for interaction in comment.get("interactions", []) or []:
+                interactions.append({
+                    "interactant_one": (interaction.get("interactantOne") or {}).get("uniProtKBAccession"),
+                    "interactant_two": (interaction.get("interactantTwo") or {}).get("uniProtKBAccession"),
+                    "gene_name": (interaction.get("interactantTwo") or {}).get("geneName"),
+                    "experiments": interaction.get("numberOfExperiments"),
+                    "organisms_differ": interaction.get("organismDiffer"),
+                })
+        return interactions
+
+    @staticmethod
+    def _cross_references(data: Dict[str, Any], databases) -> List[Dict[str, Any]]:
+        """Collect cross-references belonging to any of `databases`"""
+        refs = []
+        for ref in data.get("uniProtKBCrossReferences", []) or []:
+            if ref.get("database") not in databases:
+                continue
+            properties = {
+                prop.get("key"): prop.get("value")
+                for prop in ref.get("properties", []) or []
+            }
+            refs.append({
+                "database": ref.get("database"),
+                "id": ref.get("id"),
+                "properties": properties,
+            })
+        return refs
+
+    def _extract_go_annotations(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract Gene Ontology annotations from cross-references"""
+        annotations = []
+        for ref in self._cross_references(data, {"GO"}):
+            term = ref["properties"].get("GoTerm", "")
+            aspect, _, name = term.partition(":")
+            annotations.append({
+                "id": ref["id"],
+                "aspect": aspect,  # C (component), F (function), P (process)
+                "term": name or term,
+                "evidence": ref["properties"].get("GoEvidenceType"),
+            })
+        return annotations
+
+    def _extract_pathways(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract pathway memberships from cross-references"""
+        pathways = []
+        for ref in self._cross_references(data, {"Reactome", "KEGG", "UniPathway"}):
+            pathways.append({
+                "database": ref["database"],
+                "id": ref["id"],
+                "name": ref["properties"].get("PathwayName"),
+            })
+        return pathways
+
+    @staticmethod
+    def _extract_keywords(data: Dict[str, Any]) -> List[str]:
+        """Extract keyword names"""
+        return [
+            kw.get("name", "")
+            for kw in data.get("keywords", []) or []
+            if kw.get("name")
+        ]
 
 
 # Singleton instance

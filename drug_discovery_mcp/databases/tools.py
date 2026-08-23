@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from .uniprot import UniProtClient, query_uniprot, search_uniprot
 from .chembl import ChEMBLClient, query_chembl, search_chembl_compounds
 from .pdb import PDBClient, query_pdb, download_pdb, parse_pdb
+from .opentargets import OpenTargetsClient, query_opentargets, search_opentargets
+from .kegg import KEGGClient, query_kegg, search_kegg
+from .pubchem import PubChemClient, query_pubchem, search_pubchem
+from .ncbi import NCBIClient, query_ncbi, search_ncbi
 from .base import DatabaseError
 
 logger = logging.getLogger(__name__)
@@ -30,11 +34,10 @@ class DatabaseTools:
         self.uniprot = UniProtClient()
         self.chembl = ChEMBLClient()
         self.pdb = PDBClient()
-        # Additional clients will be initialized here
-        # self.opentargets = OpenTargetsClient()
-        # self.kegg = KEGGClient()
-        # self.pubchem = PubChemClient()
-        # self.ncbi = NCBIClient()
+        self.opentargets = OpenTargetsClient()
+        self.kegg = KEGGClient()
+        self.pubchem = PubChemClient()
+        self.ncbi = NCBIClient()
     
     def initialize(self):
         """Initialize all database clients"""
@@ -47,6 +50,10 @@ class DatabaseTools:
         self.uniprot.close()
         self.chembl.close()
         self.pdb.close()
+        self.opentargets.close()
+        self.kegg.close()
+        self.pubchem.close()
+        self.ncbi.close()
     
     # UniProt methods
     def query_uniprot(self, accession: str, **kwargs) -> Dict[str, Any]:
@@ -79,6 +86,42 @@ class DatabaseTools:
         """Parse PDB file"""
         return parse_pdb(pdb_id, file_path)
     
+    # OpenTargets methods
+    def query_opentargets(self, target_id: str, **kwargs) -> Dict[str, Any]:
+        """Query OpenTargets database for a target"""
+        return query_opentargets(target_id, **kwargs)
+    
+    def search_opentargets(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search OpenTargets targets"""
+        return search_opentargets(query, **kwargs)
+    
+    # KEGG methods
+    def query_kegg(self, pathway_id: str, **kwargs) -> Dict[str, Any]:
+        """Query KEGG database for pathway information"""
+        return query_kegg(pathway_id, **kwargs)
+
+    def search_kegg(self, database: str, query: str, **kwargs) -> Dict[str, Any]:
+        """Search a KEGG database by keyword"""
+        return search_kegg(database, query, **kwargs)
+
+    # PubChem methods
+    def query_pubchem(self, compound_id: str, **kwargs) -> Dict[str, Any]:
+        """Query PubChem database for compound information"""
+        return query_pubchem(compound_id, **kwargs)
+
+    def search_pubchem(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search PubChem compounds by name"""
+        return search_pubchem(query, **kwargs)
+
+    # NCBI methods
+    def query_ncbi(self, gene_id: str, **kwargs) -> Dict[str, Any]:
+        """Query NCBI database for gene information"""
+        return query_ncbi(gene_id, **kwargs)
+
+    def search_ncbi(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search NCBI Gene"""
+        return search_ncbi(query, **kwargs)
+    
     # Generic search method
     def search(
         self,
@@ -109,6 +152,12 @@ class DatabaseTools:
             return self.search_chembl(query, limit=limit, offset=offset, **kwargs)
         elif database == "pdb":
             return self.pdb.search(query, limit=limit, offset=offset, **kwargs)
+        elif database == "opentargets":
+            return self.opentargets.search_targets(query, limit=limit, offset=offset, **kwargs)
+        elif database == "pubchem":
+            return self.pubchem.search_compounds(query, limit=limit, **kwargs)
+        elif database == "ncbi":
+            return self.ncbi.search_genes(query, limit=limit, **kwargs)
         else:
             raise ValueError(f"Unknown database: {database}")
     
@@ -138,6 +187,14 @@ class DatabaseTools:
             return self.query_chembl(identifier, **kwargs)
         elif database == "pdb":
             return self.query_pdb(identifier, **kwargs)
+        elif database == "opentargets":
+            return self.query_opentargets(identifier, **kwargs)
+        elif database == "kegg":
+            return self.query_kegg(identifier, **kwargs)
+        elif database == "pubchem":
+            return self.query_pubchem(identifier, **kwargs)
+        elif database == "ncbi":
+            return self.query_ncbi(identifier, **kwargs)
         else:
             raise ValueError(f"Unknown database: {database}")
     
@@ -165,8 +222,7 @@ class DatabaseTools:
                 if db.lower() == "chembl":
                     results["chembl"] = self.search_chembl(query, limit=limit)
                 elif db.lower() == "pubchem":
-                    # Will be implemented when PubChem client is added
-                    pass
+                    results["pubchem"] = self.pubchem.search_compounds(query, limit=limit)
             except Exception as e:
                 logger.error(f"Search failed for {db}: {e}")
                 results[db] = {"error": str(e)}
@@ -246,9 +302,11 @@ class DatabaseTools:
         """
         try:
             uniprot_data = self.query_uniprot(accession)
-            
-            # Get related PDB structures
-            pdb_results = self.pdb.search(f"uniprot:{accession}", limit=5)
+
+            # Get related PDB structures. This needs a structured lookup on the
+            # entity's UniProt cross-reference -- a full-text search for the
+            # accession does not match.
+            pdb_results = self.pdb.search_by_uniprot(accession, limit=5)
             
             return {
                 "uniprot": uniprot_data,

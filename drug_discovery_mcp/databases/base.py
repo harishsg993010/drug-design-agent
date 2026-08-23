@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 import requests
-from tenacity import Retrying, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 from cachetools import TTLCache, cached
 
 from ..config import settings
@@ -149,7 +149,43 @@ class DatabaseClient(ABC):
             
         Returns:
             Response as dictionary
-            
+
+        Raises:
+            DatabaseError: If the request fails
+        """
+        response = self._request_raw(method, url, params, data, headers, timeout)
+
+        try:
+            return response.json()
+        except Exception:
+            return {"response": response.text}
+
+    def _request_raw(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict] = None,
+        data: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        timeout: Optional[int] = None,
+    ) -> requests.Response:
+        """
+        Make an HTTP request and return the raw response
+
+        Use this instead of ``_make_request`` when the caller needs response
+        headers (pagination totals) or a non-object JSON body (a bare array).
+
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: URL to request
+            params: Query parameters
+            data: Request body
+            headers: Request headers
+            timeout: Request timeout
+
+        Returns:
+            The requests.Response
+
         Raises:
             DatabaseError: If the request fails
         """
@@ -161,26 +197,23 @@ class DatabaseClient(ABC):
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         
+        # Retry only on transport errors -- an HTTP 4xx/5xx is surfaced as a
+        # DatabaseError below and must not be retried.
         retry_strategy = Retrying(
-            stop=stop_after_attempt(self.config.retries),
+            stop=stop_after_attempt(max(1, self.config.retries)),
             wait=wait_exponential(multiplier=1, min=4, max=10),
-            retry=(
-                requests.exceptions.RequestException,
-                aiohttp.ClientError,
-            )
+            retry=retry_if_exception_type(requests.exceptions.RequestException),
+            reraise=True,
         )
         
         try:
             self._rate_limit_check()
             
-            # For async requests
-            if asyncio.get_event_loop().is_running():
-                return asyncio.run(self._make_async_request(
-                    method, url, params, data, headers, timeout
-                ))
-            else:
-                # For sync requests
-                response = requests.request(
+            # This method is synchronous, so always use the sync client.
+            # (Async callers should await _make_async_request instead -- calling
+            # asyncio.run() here would blow up inside a running event loop.)
+            response = retry_strategy(
+                lambda: requests.request(
                     method=method,
                     url=url,
                     params=params,
@@ -188,24 +221,22 @@ class DatabaseClient(ABC):
                     headers=headers,
                     timeout=timeout,
                 )
-                
-                if response.status_code >= 400:
-                    try:
-                        error_data = response.json()
-                    except:
-                        error_data = {"error": response.text}
-                    
-                    raise DatabaseError(
-                        message=f"Request failed: {response.status_code} - {response.text}",
-                        status_code=response.status_code,
-                        details=error_data
-                    )
-                
+            )
+            
+            if response.status_code >= 400:
                 try:
-                    return response.json()
-                except:
-                    return {"response": response.text}
-                    
+                    error_data = response.json()
+                except Exception:
+                    error_data = {"error": response.text}
+
+                raise DatabaseError(
+                    message=f"Request failed: {response.status_code} - {response.text}",
+                    status_code=response.status_code,
+                    details=error_data
+                )
+
+            return response
+
         except Exception as e:
             logger.error(f"Request error for {self.get_name()}: {e}")
             raise DatabaseError(
@@ -271,11 +302,14 @@ class DatabaseClient(ABC):
     
     def close(self):
         """Close the client and clean up resources"""
-        if self.session:
-            if asyncio.get_event_loop().is_running():
+        if self.session is not None:
+            # ClientSession.close() is a coroutine
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
                 asyncio.run(self.session.close())
             else:
-                self.session.close()
+                loop.create_task(self.session.close())
         self.session = None
     
     def __enter__(self):

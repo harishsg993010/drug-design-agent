@@ -112,8 +112,6 @@ class TaskRunner:
         Returns:
             TaskResult with execution results
         """
-        import asyncio
-        
         # Get the task
         task = self.get_task(task_id)
         if task is None:
@@ -124,20 +122,20 @@ class TaskRunner:
                 execution_time=0.0
             )
         
-        # Run the task asynchronously and get the result
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If we're already in an async context, run directly
-            result = loop.run_until_complete(
-                self._run_task_async(task, tools, timeout, **kwargs)
-            )
-        else:
-            # Otherwise, create a new event loop
-            result = asyncio.run(
-                self._run_task_async(task, tools, timeout, **kwargs)
+        # Drive the async implementation on a fresh event loop. This cannot work
+        # from inside a running loop -- callers in async code must await
+        # run_task_async() directly.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.run_task_async(task_id, tools, timeout, **kwargs)
             )
         
-        return result
+        raise RuntimeError(
+            "run_task() cannot be called from a running event loop; "
+            "await run_task_async() instead"
+        )
     
     async def run_task_async(
         self,

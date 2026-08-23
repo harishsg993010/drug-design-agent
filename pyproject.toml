@@ -36,6 +36,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "mcp>=2.0.0",
     "fastapi>=0.109.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.5.0",
@@ -72,7 +73,10 @@ development = [
 ]
 
 [project.scripts]
-drug-discovery-mcp = "drug_discovery_mcp.server:main"
+# The MCP server (stdio by default) is the primary interface
+drug-discovery-mcp = "drug_discovery_mcp.mcp_server:main"
+# The REST/OpenAPI server is still available under its own script
+drug-discovery-mcp-http = "drug_discovery_mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/harishsg993010/drug-design-agent"
@@ -131,5 +135,5 @@ exclude_lines = [
     "raise NotImplementedError",
     "if 0:",
     "if __name__ == .__main__.:",
-    "class .*\Protocol":
+    "class .*Protocol",
 ]

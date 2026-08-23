@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Downloaded structure files and other API caches
+cache/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Local configuration
+.env
+
+# Benchmark run outputs. grades_detail.json embeds rubric text and ground
+# truths from the gated DrugDiscoveryBench dataset -- never publish these.
+local_runs/
+
+# Scratch written into the repo root by agent runs
+analyze_*.py
+check_*.py
+verify_*.py
+find_*.py
+get_*.py
+count_*.py
+search_*.py
+melanoma_*.py
+simple_analysis.py
+final_check.py
+clinvar_test*.py
+answer.md
+*.pdb
+*.pdf
+rd_filters/

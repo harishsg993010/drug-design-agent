@@ -18,10 +18,10 @@ from .base import DatabaseClient, DatabaseError
 from .uniprot import UniProtClient
 from .chembl import ChEMBLClient
 from .pdb import PDBClient
-from .opentargets import OpenTargetsClient
-from .kegg import KEGGClient
-from .pubchem import PubChemClient
-from .ncbi import NCBIClient
+from .opentargets import OpenTargetsClient, Target, Disease, Association
+from .kegg import KEGGClient, KEGGPathway, KEGGCompound, KEGGGene
+from .pubchem import PubChemClient, PubChemCompound
+from .ncbi import NCBIClient, NCBIGene, NCBIPublication
 from .tools import DatabaseTools
 
 __all__ = [
@@ -31,8 +31,17 @@ __all__ = [
     "ChEMBLClient",
     "PDBClient",
     "OpenTargetsClient",
+    "Target",
+    "Disease",
+    "Association",
     "KEGGClient",
+    "KEGGPathway",
+    "KEGGCompound",
+    "KEGGGene",
     "PubChemClient",
+    "PubChemCompound",
     "NCBIClient",
+    "NCBIGene",
+    "NCBIPublication",
     "DatabaseTools",
 ]

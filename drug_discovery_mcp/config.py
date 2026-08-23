@@ -13,16 +13,16 @@ class DatabaseConfig(BaseSettings):
     """Configuration for external database connections"""
     
     uniprot: Dict[str, Any] = Field(
-        default={"endpoint": "https://www.ebi.ac.uk/proteins/api", "rate_limit": 10}
+        default={"endpoint": "https://rest.uniprot.org/uniprotkb", "rate_limit": 10}
     )
     chembl: Dict[str, Any] = Field(
-        default={"endpoint": "https://www.ebi.ac.uk/chembl/api", "rate_limit": 10}
+        default={"endpoint": "https://www.ebi.ac.uk/chembl/api/data", "rate_limit": 10}
     )
     pdb: Dict[str, Any] = Field(
         default={"endpoint": "https://data.rcsb.org", "rate_limit": 20}
     )
     open_targets: Dict[str, Any] = Field(
-        default={"endpoint": "https://api.opentargets.io/v3", "rate_limit": 10}
+        default={"endpoint": "https://api.platform.opentargets.org/api/v4/graphql", "rate_limit": 10}
     )
     kegg: Dict[str, Any] = Field(
         default={"endpoint": "https://rest.kegg.jp", "rate_limit": 10}

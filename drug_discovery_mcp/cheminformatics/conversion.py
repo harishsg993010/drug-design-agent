@@ -68,7 +68,7 @@ class ConversionTools(CheminformaticsBase):
             mol = self._smiles_to_mol(smiles)
             
             # Generate InChI
-            inchi = Chem.MolToInchi(mol, options=options)
+            inchi = Chem.MolToInchi(mol, options=options or "")
             
             if not inchi:
                 raise CheminformaticsError(f"Failed to convert SMILES to InChI: {smiles}")

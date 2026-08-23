@@ -114,10 +114,44 @@ class PDBClient(DatabaseClient):
     - Structure factors
     """
     
+    # RCSB splits its API across three hosts: the data API (config.endpoint),
+    # the search service, and a GraphQL endpoint used for batch lookups.
+    SEARCH_ENDPOINT = "https://search.rcsb.org/rcsbsearch/v2/query"
+    GRAPHQL_ENDPOINT = "https://data.rcsb.org/graphql"
+
+    _ENTRY_QUERY = """
+    query Entry($id: String!) {
+      entry(entry_id: $id) {
+        rcsb_id
+        struct { title }
+        exptl { method }
+        refine { ls_d_res_high ls_R_factor_R_work ls_R_factor_R_free }
+        reflns { number_obs }
+        cell { length_a length_b length_c angle_alpha angle_beta angle_gamma }
+        symmetry { space_group_name_H_M }
+        rcsb_accession_info { initial_release_date }
+        struct_keywords { pdbx_keywords text }
+        audit_author { name }
+        rcsb_entry_info {
+          deposited_atom_count
+          deposited_model_count
+          molecular_weight
+        }
+        polymer_entities {
+          rcsb_polymer_entity_container_identifiers { auth_asym_ids }
+        }
+        nonpolymer_entities {
+          nonpolymer_comp { chem_comp { id name formula } }
+          rcsb_nonpolymer_entity_container_identifiers { auth_asym_ids }
+        }
+      }
+    }
+    """
+
     def __init__(self, config: Optional[DatabaseConfig] = None, cache_dir: Optional[Path] = None):
         """
         Initialize PDB client
-        
+
         Args:
             config: Custom configuration
             cache_dir: Directory for caching downloaded PDB files
@@ -125,6 +159,7 @@ class PDBClient(DatabaseClient):
         super().__init__(config or self.get_default_config())
         self.cache_dir = cache_dir or Path("./cache/pdb")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._chem_comp_cache: Dict[str, Dict[str, Any]] = {}
     
     @classmethod
     def get_default_config(cls) -> DatabaseConfig:
@@ -145,6 +180,60 @@ class PDBClient(DatabaseClient):
     def get_name(self) -> str:
         """Get the name of this database"""
         return "PDB"
+
+    def _entity_ids(self, pdb_id: str, key: str) -> List[str]:
+        """
+        List an entry's entity IDs of a given kind
+
+        Args:
+            pdb_id: PDB ID
+            key: Container identifier key, e.g. "polymer_entity_ids"
+
+        Returns:
+            List of entity IDs (empty if the entry has none of that kind)
+        """
+        url = f"{self.config.endpoint}/rest/v1/core/entry/{pdb_id}"
+        entry = self._make_request("GET", url)
+        identifiers = entry.get("rcsb_entry_container_identifiers", {}) or {}
+        return identifiers.get(key, []) or []
+
+    def _fetch_entry_summaries(self, entry_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch summary metadata for several entries in one GraphQL round trip
+
+        The search service returns bare identifiers, so titles and experimental
+        metadata have to be looked up separately.
+
+        Args:
+            entry_ids: PDB IDs to look up
+
+        Returns:
+            List of summary dictionaries, in the order given
+        """
+        if not entry_ids:
+            return []
+
+        query = """
+        query Entries($ids: [String!]!) {
+          entries(entry_ids: $ids) {
+            rcsb_id
+            struct { title }
+            exptl { method }
+            refine { ls_d_res_high }
+            rcsb_accession_info { initial_release_date }
+            struct_keywords { pdbx_keywords }
+          }
+        }
+        """
+        payload = {"query": query, "variables": {"ids": entry_ids}}
+        data = self._make_request("POST", self.GRAPHQL_ENDPOINT, data=payload)
+
+        if data.get("errors"):
+            messages = "; ".join(str(e.get("message", e)) for e in data["errors"])
+            raise DatabaseError(f"GraphQL error: {messages}")
+
+        entries = (data.get("data") or {}).get("entries") or []
+        return [self._parse_entry_summary(e) for e in entries if e]
     
     def query(self, pdb_id: str) -> PDBEntry:
         """
@@ -156,11 +245,28 @@ class PDBClient(DatabaseClient):
         Returns:
             PDBEntry object with entry information
         """
-        url = f"{self.config.endpoint}/pdb/v1/entries/{pdb_id}"
-        
+        # A single GraphQL call resolves the entry together with its chain
+        # identifiers and bound ligands; the REST entry document only carries
+        # entity numbers, which are not chain names.
+        payload = {
+            "query": self._ENTRY_QUERY,
+            "variables": {"id": pdb_id},
+        }
+
         try:
-            data = self._make_request("GET", url)
-            return self._parse_entry(data)
+            response = self._make_request("POST", self.GRAPHQL_ENDPOINT, data=payload)
+
+            if response.get("errors"):
+                messages = "; ".join(
+                    str(e.get("message", e)) for e in response["errors"]
+                )
+                raise DatabaseError(f"GraphQL error: {messages}")
+
+            entry = (response.get("data") or {}).get("entry")
+            if not entry:
+                raise DatabaseError(f"Entry not found: {pdb_id}")
+
+            return self._parse_entry(entry)
         except Exception as e:
             logger.error(f"PDB query failed for {pdb_id}: {e}")
             raise DatabaseError(f"Failed to query PDB for {pdb_id}: {e}")
@@ -184,20 +290,32 @@ class PDBClient(DatabaseClient):
         Returns:
             Dictionary with search results
         """
-        url = f"{self.config.endpoint}/pdb/v1/entries"
-        
-        params = {
-            "query": query,
-            "limit": limit,
-            "offset": offset,
-            "sort": sort
+        payload = {
+            "query": {
+                "type": "terminal",
+                "service": "full_text",
+                "parameters": {"value": query},
+            },
+            "return_type": "entry",
+            "request_options": {
+                "paginate": {"start": offset, "rows": limit},
+                "results_content_type": ["experimental"],
+                "scoring_strategy": "combined",
+            },
         }
-        
+
         try:
-            data = self._make_request("GET", url, params=params)
+            data = self._make_request("POST", self.SEARCH_ENDPOINT, data=payload)
+            hits = data.get("result_set", []) or []
+            scores = {h.get("identifier"): h.get("score", 0) for h in hits}
+            summaries = self._fetch_entry_summaries(list(scores))
+
+            for summary in summaries:
+                summary["score"] = scores.get(summary["pdb_id"], 0)
+
             return {
-                "results": [self._parse_entry_summary(item) for item in data.get("results", [])],
-                "total": data.get("total", 0),
+                "results": summaries,
+                "total": data.get("total_count", 0),
                 "limit": limit,
                 "offset": offset
             }
@@ -222,7 +340,7 @@ class PDBClient(DatabaseClient):
             logger.debug(f"Using cached PDB file: {cache_file}")
             return str(cache_file)
         
-        url = f"{self.config.endpoint}/pdb/v1/files/{pdb_id}.{format}"
+        url = f"https://files.rcsb.org/download/{pdb_id}.{format}"
         
         try:
             # For PDB files, we need to handle the response differently
@@ -293,11 +411,14 @@ class PDBClient(DatabaseClient):
         Returns:
             List of PDBChain objects
         """
-        url = f"{self.config.endpoint}/pdb/v1/entries/{pdb_id}/chains"
-        
         try:
-            data = self._make_request("GET", url)
-            return [self._parse_chain(pdb_id, item) for item in data.get("results", [])]
+            chains = []
+            for entity_id in self._entity_ids(pdb_id, "polymer_entity_ids"):
+                url = f"{self.config.endpoint}/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
+                entity = self._make_request("GET", url)
+                # One polymer entity can be instantiated as several chains
+                chains.extend(self._parse_chain(pdb_id, entity))
+            return chains
         except Exception as e:
             logger.error(f"Failed to get chains for {pdb_id}: {e}")
             raise DatabaseError(f"Failed to get chains: {e}")
@@ -312,11 +433,13 @@ class PDBClient(DatabaseClient):
         Returns:
             List of Ligand objects
         """
-        url = f"{self.config.endpoint}/pdb/v1/entries/{pdb_id}/ligands"
-        
         try:
-            data = self._make_request("GET", url)
-            return [self._parse_ligand(pdb_id, item) for item in data.get("results", [])]
+            ligands = []
+            for entity_id in self._entity_ids(pdb_id, "non_polymer_entity_ids"):
+                url = f"{self.config.endpoint}/rest/v1/core/nonpolymer_entity/{pdb_id}/{entity_id}"
+                entity = self._make_request("GET", url)
+                ligands.extend(self._parse_ligand(pdb_id, entity))
+            return ligands
         except Exception as e:
             logger.error(f"Failed to get ligands for {pdb_id}: {e}")
             raise DatabaseError(f"Failed to get ligands: {e}")
@@ -332,11 +455,13 @@ class PDBClient(DatabaseClient):
         Returns:
             Sequence as string
         """
-        url = f"{self.config.endpoint}/pdb/v1/entries/{pdb_id}/chains/{chain_id}/sequence"
-        
         try:
-            data = self._make_request("GET", url)
-            return data.get("sequence", "")
+            for chain in self.get_chains(pdb_id):
+                if chain.chain_id == chain_id:
+                    return chain.sequence
+            raise DatabaseError(f"Chain {chain_id} not found in {pdb_id}")
+        except DatabaseError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get sequence for {pdb_id}/{chain_id}: {e}")
             raise DatabaseError(f"Failed to get sequence: {e}")
@@ -352,16 +477,23 @@ class PDBClient(DatabaseClient):
         Returns:
             Dictionary with alignment information
         """
-        url = f"{self.config.endpoint}/pdb/v1/align/{pdb_id1}/{pdb_id2}"
-        
+        # RCSB exposes no public REST alignment endpoint, so superimpose the two
+        # structures locally instead of calling out.
+        from ..structural_biology.alignment import superimpose_structures
+
         try:
-            data = self._make_request("GET", url)
+            result = superimpose_structures(pdb_id1, pdb_id2)
+            if "error" in result:
+                raise DatabaseError(result["error"])
             return {
-                "rmsd": data.get("rmsd", 0),
-                "aligned_residues": data.get("aligned_residues", 0),
-                "sequence_identity": data.get("sequence_identity", 0),
-                "alignment": data.get("alignment", [])
+                "rmsd": result.get("rmsd", 0),
+                "aligned_residues": result.get("aligned_residues", 0),
+                "transformation_matrix": result.get("transformation_matrix"),
+                "translation_vector": result.get("translation_vector"),
+                "residue_differences": result.get("residue_differences", []),
             }
+        except DatabaseError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get structure alignment: {e}")
             raise DatabaseError(f"Failed to get structure alignment: {e}")
@@ -376,16 +508,78 @@ class PDBClient(DatabaseClient):
         Returns:
             Dictionary with experimental metadata
         """
-        url = f"{self.config.endpoint}/pdb/v1/entries/{pdb_id}/experimental"
-        
+        url = f"{self.config.endpoint}/rest/v1/core/entry/{pdb_id}"
+
         try:
             data = self._make_request("GET", url)
-            return data
+            return self._parse_experimental(data)
         except Exception as e:
             logger.error(f"Failed to get experimental data for {pdb_id}: {e}")
             raise DatabaseError(f"Failed to get experimental data: {e}")
     
-    def search_by_sequence(self, sequence: str, limit: int = 10) -> Dict[str, Any]:
+    def search_by_uniprot(self, accession: str, limit: int = 10) -> Dict[str, Any]:
+        """
+        Find PDB entries whose polymer entities map to a UniProt accession
+
+        Args:
+            accession: UniProt accession, e.g. "P04637"
+            limit: Maximum number of results
+
+        Returns:
+            Dictionary with search results
+        """
+        payload = {
+            "query": {
+                "type": "group",
+                "logical_operator": "and",
+                "nodes": [
+                    {
+                        "type": "terminal",
+                        "service": "text",
+                        "parameters": {
+                            "attribute": "rcsb_polymer_entity_container_identifiers"
+                                         ".reference_sequence_identifiers.database_accession",
+                            "operator": "in",
+                            "value": [accession],
+                        },
+                    },
+                    {
+                        "type": "terminal",
+                        "service": "text",
+                        "parameters": {
+                            "attribute": "rcsb_polymer_entity_container_identifiers"
+                                         ".reference_sequence_identifiers.database_name",
+                            "operator": "exact_match",
+                            "value": "UniProt",
+                        },
+                    },
+                ],
+            },
+            "return_type": "entry",
+            "request_options": {"paginate": {"start": 0, "rows": limit}},
+        }
+
+        try:
+            data = self._make_request("POST", self.SEARCH_ENDPOINT, data=payload)
+            hits = data.get("result_set", []) or []
+            entry_ids = [h.get("identifier") for h in hits if h.get("identifier")]
+
+            return {
+                "results": self._fetch_entry_summaries(entry_ids),
+                "total": data.get("total_count", 0),
+                "accession": accession,
+            }
+        except Exception as e:
+            logger.error(f"Failed to search PDB by UniProt accession {accession}: {e}")
+            raise DatabaseError(f"Failed to search PDB by UniProt accession: {e}")
+
+    def search_by_sequence(
+        self,
+        sequence: str,
+        limit: int = 10,
+        identity_cutoff: float = 0.9,
+        evalue_cutoff: float = 1.0,
+    ) -> Dict[str, Any]:
         """
         Search PDB by protein sequence
         
@@ -396,76 +590,251 @@ class PDBClient(DatabaseClient):
         Returns:
             Dictionary with search results
         """
-        url = f"{self.config.endpoint}/pdb/v1/sequence"
-        
-        params = {
-            "sequence": sequence,
-            "limit": limit
+        payload = {
+            "query": {
+                "type": "terminal",
+                "service": "sequence",
+                "parameters": {
+                    "sequence_type": "protein",
+                    "value": sequence,
+                    "identity_cutoff": identity_cutoff,
+                    "evalue_cutoff": evalue_cutoff,
+                },
+            },
+            "return_type": "polymer_entity",
+            "request_options": {"paginate": {"start": 0, "rows": limit}},
         }
-        
+
         try:
-            data = self._make_request("GET", url, params=params)
+            data = self._make_request("POST", self.SEARCH_ENDPOINT, data=payload)
+            hits = data.get("result_set", []) or []
+
+            # Hits are "<entry>_<entity>"; enrich by the entry half
+            entry_ids = []
+            for hit in hits:
+                entry_id = hit.get("identifier", "").split("_")[0]
+                if entry_id and entry_id not in entry_ids:
+                    entry_ids.append(entry_id)
+
+            summaries = {s["pdb_id"]: s for s in self._fetch_entry_summaries(entry_ids)}
+
+            results = []
+            for hit in hits:
+                identifier = hit.get("identifier", "")
+                entry_id = identifier.split("_")[0]
+                summary = dict(summaries.get(entry_id, {"pdb_id": entry_id}))
+                summary["entity_id"] = identifier
+                summary["score"] = hit.get("score", 0)
+                results.append(summary)
+
             return {
-                "results": [self._parse_entry_summary(item) for item in data.get("results", [])],
-                "total": data.get("total", 0)
+                "results": results,
+                "total": data.get("total_count", 0)
             }
         except Exception as e:
             logger.error(f"Failed to search by sequence: {e}")
             raise DatabaseError(f"Failed to search by sequence: {e}")
     
+    @staticmethod
+    def _first(items: Any, key: str) -> Any:
+        """Read `key` off the first element of an RCSB list-valued category"""
+        if isinstance(items, list) and items:
+            return (items[0] or {}).get(key)
+        if isinstance(items, dict):
+            return items.get(key)
+        return None
+
+    @staticmethod
+    def _date(value: Optional[str]) -> Optional[str]:
+        """Trim an RCSB ISO timestamp down to its date part"""
+        if not value:
+            return None
+        return str(value).split("T")[0]
+
     def _parse_entry(self, data: Dict[str, Any]) -> PDBEntry:
-        """Parse PDB entry data"""
+        """Parse an RCSB entry document into a PDBEntry"""
+        keywords = data.get("struct_keywords", {}) or {}
+        accession = data.get("rcsb_accession_info", {}) or {}
+
+        keyword_text = keywords.get("text") or ""
+        keyword_list = [k.strip() for k in keyword_text.split(",") if k.strip()]
+
+        # Chain identifiers, flattened across polymer entities
+        chains = []
+        for entity in data.get("polymer_entities") or []:
+            ids = (entity.get("rcsb_polymer_entity_container_identifiers") or {})
+            for chain_id in ids.get("auth_asym_ids") or []:
+                if chain_id not in chains:
+                    chains.append(chain_id)
+
+        ligands = []
+        for entity in data.get("nonpolymer_entities") or []:
+            chem = ((entity.get("nonpolymer_comp") or {}).get("chem_comp")) or {}
+            ids = (entity.get("rcsb_nonpolymer_entity_container_identifiers") or {})
+            ligands.append({
+                "ligand_id": chem.get("id"),
+                "name": chem.get("name"),
+                "formula": chem.get("formula"),
+                "chains": ids.get("auth_asym_ids") or [],
+            })
+
         return PDBEntry(
-            pdb_id=data.get("pdb_id", ""),
-            title=data.get("title", ""),
-            resolution=data.get("resolution", None),
-            method=data.get("method", None),
-            chains=data.get("chains", []),
-            ligands=data.get("ligands", []),
-            authors=data.get("authors", []),
-            release_date=data.get("release_date", None),
-            experimental_data=data.get("experimental_data", {}),
-            classification=data.get("classification", None),
-            keywords=data.get("keywords", [])
+            pdb_id=data.get("rcsb_id") or (data.get("entry", {}) or {}).get("id", ""),
+            title=(data.get("struct", {}) or {}).get("title", ""),
+            resolution=self._first(data.get("refine"), "ls_d_res_high"),
+            method=self._first(data.get("exptl"), "method"),
+            chains=chains,
+            ligands=ligands,
+            authors=[
+                a.get("name", "")
+                for a in data.get("audit_author", []) or []
+                if a.get("name")
+            ],
+            release_date=self._date(accession.get("initial_release_date")),
+            experimental_data=self._parse_experimental(data),
+            classification=keywords.get("pdbx_keywords"),
+            keywords=keyword_list,
         )
-    
+
     def _parse_entry_summary(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse a summary entry from search results"""
+        """Parse a summary entry, as returned by the batch GraphQL lookup"""
+        accession = data.get("rcsb_accession_info") or {}
+        keywords = data.get("struct_keywords") or {}
+
         return {
-            "pdb_id": data.get("pdb_id", ""),
-            "title": data.get("title", ""),
-            "resolution": data.get("resolution", None),
-            "method": data.get("method", None),
-            "release_date": data.get("release_date", None),
-            "score": data.get("score", 0)
+            "pdb_id": data.get("rcsb_id", ""),
+            "title": (data.get("struct") or {}).get("title", ""),
+            "resolution": self._first(data.get("refine"), "ls_d_res_high"),
+            "method": self._first(data.get("exptl"), "method"),
+            "release_date": self._date(accession.get("initial_release_date")),
+            "classification": keywords.get("pdbx_keywords"),
+            "score": data.get("score", 0),
         }
-    
-    def _parse_chain(self, pdb_id: str, data: Dict[str, Any]) -> PDBChain:
-        """Parse chain data"""
-        return PDBChain(
-            pdb_id=pdb_id,
-            chain_id=data.get("chain_id", ""),
-            sequence=data.get("sequence", ""),
-            num_residues=data.get("num_residues", 0),
-            entity_type=data.get("entity_type", ""),
-            description=data.get("description", None),
-            uniprot_accession=data.get("uniprot_accession", None)
+
+    def _parse_experimental(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract experimental metadata from an RCSB entry document"""
+        cell = data.get("cell", {}) or {}
+        symmetry = data.get("symmetry", {}) or {}
+        reflns = data.get("reflns")
+        entry_info = data.get("rcsb_entry_info", {}) or {}
+
+        return {
+            "method": self._first(data.get("exptl"), "method"),
+            "resolution": self._first(data.get("refine"), "ls_d_res_high"),
+            "r_factor_work": self._first(data.get("refine"), "ls_R_factor_R_work"),
+            "r_factor_free": self._first(data.get("refine"), "ls_R_factor_R_free"),
+            "space_group": symmetry.get("space_group_name_H_M"),
+            "unit_cell": {
+                "a": cell.get("length_a"),
+                "b": cell.get("length_b"),
+                "c": cell.get("length_c"),
+                "alpha": cell.get("angle_alpha"),
+                "beta": cell.get("angle_beta"),
+                "gamma": cell.get("angle_gamma"),
+            } if cell else {},
+            "observed_reflections": self._first(reflns, "number_obs"),
+            "deposited_atom_count": entry_info.get("deposited_atom_count"),
+            "deposited_model_count": entry_info.get("deposited_model_count"),
+            "molecular_weight": entry_info.get("molecular_weight"),
+        }
+
+    def _parse_chain(self, pdb_id: str, data: Dict[str, Any]) -> List[PDBChain]:
+        """
+        Parse a polymer entity into one PDBChain per instantiated chain
+
+        RCSB models sequences per *entity*; a single entity can appear as
+        several chains (e.g. the three p53 copies in 1TUP), so this returns a
+        list rather than a single chain.
+        """
+        poly = data.get("entity_poly", {}) or {}
+        entity = data.get("rcsb_polymer_entity", {}) or {}
+        identifiers = data.get("rcsb_polymer_entity_container_identifiers", {}) or {}
+
+        sequence = poly.get("pdbx_seq_one_letter_code_can") or ""
+        references = identifiers.get("reference_sequence_identifiers", []) or []
+        uniprot = next(
+            (r.get("database_accession") for r in references
+             if r.get("database_name") == "UniProt"),
+            None,
         )
-    
-    def _parse_ligand(self, pdb_id: str, data: Dict[str, Any]) -> Ligand:
-        """Parse ligand data"""
-        return Ligand(
-            pdb_id=pdb_id,
-            ligand_id=data.get("ligand_id", ""),
-            chain=data.get("chain", ""),
-            residue_number=data.get("residue_number", 0),
-            name=data.get("name", ""),
-            smiles=data.get("smiles", None),
-            inchi=data.get("inchi", None),
-            formula=data.get("formula", None),
-            binding_site=data.get("binding_site", None),
-            binding_affinity=data.get("binding_affinity", None)
-        )
+        if uniprot is None:
+            uniprot_ids = identifiers.get("uniprot_ids") or []
+            uniprot = uniprot_ids[0] if uniprot_ids else None
+
+        auth_ids = identifiers.get("auth_asym_ids") or identifiers.get("asym_ids") or []
+
+        return [
+            PDBChain(
+                pdb_id=pdb_id,
+                chain_id=chain_id,
+                sequence=sequence,
+                num_residues=len(sequence),
+                entity_type=poly.get("rcsb_entity_polymer_type", ""),
+                description=entity.get("pdbx_description"),
+                uniprot_accession=uniprot,
+            )
+            for chain_id in auth_ids
+        ]
+
+    def _parse_ligand(self, pdb_id: str, data: Dict[str, Any]) -> List[Ligand]:
+        """
+        Parse a non-polymer entity into one Ligand per chain it occupies
+
+        Chemical identifiers (SMILES/InChI/formula) live on the chemical
+        component definition, which is fetched separately and cached.
+        """
+        nonpoly = data.get("pdbx_entity_nonpoly", {}) or {}
+        entity = data.get("rcsb_nonpolymer_entity", {}) or {}
+        identifiers = data.get("rcsb_nonpolymer_entity_container_identifiers", {}) or {}
+
+        comp_id = nonpoly.get("comp_id") or identifiers.get("nonpolymer_comp_id") or ""
+        chem = self._get_chem_comp(comp_id) if comp_id else {}
+        auth_ids = identifiers.get("auth_asym_ids") or identifiers.get("asym_ids") or [""]
+
+        return [
+            Ligand(
+                pdb_id=pdb_id,
+                ligand_id=comp_id,
+                chain=chain_id,
+                residue_number=0,
+                name=nonpoly.get("name") or entity.get("pdbx_description") or "",
+                smiles=chem.get("smiles"),
+                inchi=chem.get("inchi"),
+                formula=chem.get("formula"),
+            )
+            for chain_id in auth_ids
+        ]
+
+    def _get_chem_comp(self, comp_id: str) -> Dict[str, Any]:
+        """
+        Look up a chemical component definition (SMILES, InChI, formula)
+
+        Results are memoised per client because the same component (ZN, HOH,
+        ATP...) recurs across entries.
+        """
+        if comp_id in self._chem_comp_cache:
+            return self._chem_comp_cache[comp_id]
+
+        try:
+            url = f"{self.config.endpoint}/rest/v1/core/chemcomp/{comp_id}"
+            data = self._make_request("GET", url)
+        except DatabaseError as e:
+            logger.warning(f"Could not fetch chemical component {comp_id}: {e}")
+            self._chem_comp_cache[comp_id] = {}
+            return {}
+
+        chem_comp = data.get("chem_comp", {}) or {}
+        descriptor = data.get("rcsb_chem_comp_descriptor", {}) or {}
+
+        result = {
+            "formula": chem_comp.get("formula"),
+            "formula_weight": chem_comp.get("formula_weight"),
+            "smiles": descriptor.get("SMILES_stereo") or descriptor.get("SMILES"),
+            "inchi": descriptor.get("InChI"),
+            "inchikey": descriptor.get("InChIKey"),
+        }
+        self._chem_comp_cache[comp_id] = result
+        return result
     
     def _parse_biopython_structure(self, pdb_id: str, structure) -> PDBStructure:
         """Parse Biopython structure into PDBStructure"""

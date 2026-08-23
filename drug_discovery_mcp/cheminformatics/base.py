@@ -57,14 +57,21 @@ class CheminformaticsBase:
     def _check_rdkit(self) -> bool:
         """Check if RDKit is available"""
         try:
-            import rdkit
-            from rdkit import Chem
+            import rdkit  # noqa: F401
+            from rdkit import Chem  # noqa: F401
             return True
         except ImportError:
             return False
     
     def _get_rdkit(self):
-        """Get RDKit module with error checking"""
+        """
+        Get the RDKit ``Chem`` module with error checking
+        
+        The sub-modules used across this package (``Crippen``, ``Lipinski``,
+        ``rdMolDescriptors``, ``Descriptors`` and ``AllChem``) are not bound on
+        ``rdkit.Chem`` until they are imported, so import them here to make
+        ``Chem.<submodule>`` attribute access work for callers.
+        """
         if not self._rdkit_available:
             raise CheminformaticsError(
                 "RDKit is not installed. Please install it with: conda install -c conda-forge rdkit"
@@ -72,6 +79,13 @@ class CheminformaticsBase:
         
         try:
             from rdkit import Chem
+            from rdkit.Chem import (  # noqa: F401
+                AllChem,
+                Crippen,
+                Descriptors,
+                Lipinski,
+                rdMolDescriptors,
+            )
             return Chem
         except ImportError as e:
             raise CheminformaticsError(f"Failed to import RDKit: {e}")
@@ -125,7 +139,7 @@ class CheminformaticsBase:
         """Get molecular formula from molecule"""
         try:
             Chem = self._get_rdkit()
-            return Chem.rdMolDescriptor.CalcMolFormula(mol)
+            return Chem.rdMolDescriptors.CalcMolFormula(mol)
         except Exception as e:
             logger.warning(f"Failed to get molecular formula: {e}")
             return ""
@@ -134,7 +148,7 @@ class CheminformaticsBase:
         """Get molecular weight from molecule"""
         try:
             Chem = self._get_rdkit()
-            return Chem.rdMolDescriptor.CalcExactMolWt(mol)
+            return Chem.rdMolDescriptors.CalcExactMolWt(mol)
         except Exception as e:
             logger.warning(f"Failed to get molecular weight: {e}")
             return 0.0
