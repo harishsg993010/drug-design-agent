@@ -109,7 +109,7 @@ Three domains of tools, exposed over MCP, all hitting live APIs.
 
 **Structural biology** — `download_pdb` `parse_pdb` `superimpose_structures` `calculate_rmsd` `analyze_binding_site` `find_interactions` `analyze_conformation` `compare_structures` `extract_ligand` `analyze_solvent_accessibility`
 
-Six more clients are built and tested — AlphaFold, Europe PMC, ClinicalTrials.gov, Reactome, ClinVar and GTEx — in [`databases/science.py`](drug_discovery_mcp/databases/science.py), pending registration.
+Six more clients are built and tested — AlphaFold, Europe PMC, ClinicalTrials.gov, Reactome, ClinVar and GTEx — in [`databases/science.py`](drug_discovery_mcp/databases/science.py),
 
 ---
 
